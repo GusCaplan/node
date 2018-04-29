@@ -114,11 +114,11 @@ const e = new EventEmitter();
 
 ```js
 import { readFile } from 'fs';
-readFile('./foo.txt', (err, body) => {
+readFile('./foo.txt', (err, source) => {
   if (err) {
     console.error(err);
   } else {
-    console.log(body);
+    console.log(source);
   }
 });
 ```
