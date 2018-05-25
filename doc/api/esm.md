@@ -44,7 +44,7 @@ into ESM graphs at runtime.
 The `import.meta` metaproperty is an `Object` that contains the following
 property:
 
-* `url` {string} The absolute `file:` URL of the module.
+* `url` {string} The absolute URL of the module.
 
 ### Unsupported
 
@@ -82,7 +82,7 @@ import './foo?query=1'; // loads ./foo with query of "?query=1"
 import './foo?query=2'; // loads ./foo with query of "?query=2"
 ```
 
-For now, only modules using the `file:` protocol can be loaded.
+For now, only modules using the `file:` and `data:` protocol can be loaded.
 
 ## Interop with existing modules
 

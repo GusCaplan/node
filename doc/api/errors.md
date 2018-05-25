@@ -1148,6 +1148,11 @@ An invalid HTTP token was supplied.
 
 An IP address is not valid.
 
+<a id="ERR_INVALID_MIME_TYPE"></a>
+### ERR_INVALID_MIME_TYPE
+
+An invalid or unknown MIME type was passed.
+
 <a id="ERR_INVALID_OPT_VALUE"></a>
 ### ERR_INVALID_OPT_VALUE
 
