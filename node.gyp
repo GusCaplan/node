@@ -1057,7 +1057,6 @@
         'node_protocol_files': [
           '<(protocol_path)/lib/Allocator_h.template',
           '<(protocol_path)/lib/Array_h.template',
-          '<(protocol_path)/lib/Collections_h.template',
           '<(protocol_path)/lib/DispatcherBase_cpp.template',
           '<(protocol_path)/lib/DispatcherBase_h.template',
           '<(protocol_path)/lib/ErrorSupport_cpp.template',
@@ -1077,7 +1076,7 @@
           '<(protocol_path)/templates/Imported_h.template',
           '<(protocol_path)/templates/TypeBuilder_cpp.template',
           '<(protocol_path)/templates/TypeBuilder_h.template',
-          '<(protocol_path)/CodeGenerator.py',
+          '<(protocol_path)/code_generator.py',
         ]
       },
       'targets': [
@@ -1105,7 +1104,7 @@
               ],
               'action': [
                 'python',
-                'tools/inspector_protocol/ConvertProtocolToJSON.py',
+                'tools/inspector_protocol/convert_protocol_to_json.py',
                 '<@(_inputs)',
                 '<@(_outputs)',
               ],
@@ -1130,7 +1129,7 @@
               ],
               'action': [
                 'python',
-                '<(protocol_path)/CodeGenerator.py',
+                '<(protocol_path)/code_generator.py',
                 '--jinja_dir', '<@(protocol_path)/..',
                 '--output_base', '<(SHARED_INTERMEDIATE_DIR)/src/',
                 '--config', '<(SHARED_INTERMEDIATE_DIR)/node_protocol_config.json',
@@ -1160,7 +1159,7 @@
               ],
               'action': [
                 'python',
-                'tools/inspector_protocol/ConvertProtocolToJSON.py',
+                'tools/inspector_protocol/convert_protocol_to_json.py',
                 '<@(_inputs)',
                 '<@(_outputs)',
               ],
@@ -1176,7 +1175,7 @@
               ],
               'action': [
                 'python',
-                'tools/inspector_protocol/ConcatenateProtocols.py',
+                'tools/inspector_protocol/concatenate_protocols.py',
                 '<@(_inputs)',
                 '<@(_outputs)',
               ],
