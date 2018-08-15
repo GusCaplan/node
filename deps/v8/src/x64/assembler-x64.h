@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "src/assembler.h"
+#include "src/x64/constants-x64.h"
 #include "src/x64/sse-instr.h"
 
 namespace v8 {
@@ -219,6 +220,7 @@ typedef XMMRegister Simd128Register;
 DOUBLE_REGISTERS(DECLARE_REGISTER)
 #undef DECLARE_REGISTER
 constexpr DoubleRegister no_double_reg = DoubleRegister::no_reg();
+constexpr DoubleRegister no_dreg = DoubleRegister::no_reg();
 
 enum Condition {
   // any value < 0 is considered no_condition
@@ -421,7 +423,68 @@ static_assert(sizeof(Operand) <= 2 * kPointerSize,
   V(shr, 0x5)                     \
   V(sar, 0x7)
 
-class Assembler : public AssemblerBase {
+// Partial Constant Pool
+// Different from complete constant pool (like arm does), partial constant pool
+// only takes effects for shareable constants in order to reduce code size.
+// Partial constant pool does not emit constant pool entries at the end of each
+// code object. Instead, it keeps the first shareable constant inlined in the
+// instructions and uses rip-relative memory loadings for the same constants in
+// subsequent instructions. These rip-relative memory loadings will target at
+// the position of the first inlined constant. For example:
+//
+//  REX.W movq r10,0x7f9f75a32c20   ; 10 bytes
+//  …
+//  REX.W movq r10,0x7f9f75a32c20   ; 10 bytes
+//  …
+//
+// turns into
+//
+//  REX.W movq r10,0x7f9f75a32c20   ; 10 bytes
+//  …
+//  REX.W movq r10,[rip+0xffffff96] ; 7 bytes
+//  …
+
+class ConstPool {
+ public:
+  explicit ConstPool(Assembler* assm) : assm_(assm) {}
+  // Returns true when partial constant pool is valid for this entry.
+  bool TryRecordEntry(intptr_t data, RelocInfo::Mode mode);
+  bool IsEmpty() const { return entries_.empty(); }
+
+  void PatchEntries();
+  // Discard any pending pool entries.
+  void Clear();
+
+ private:
+  // Adds a shared entry to entries_. Returns true if this is not the first time
+  // we add this entry, false otherwise.
+  bool AddSharedEntry(uint64_t data, int offset);
+
+  // Check if the instruction is a rip-relative move.
+  bool IsMoveRipRelative(byte* instr);
+
+  Assembler* assm_;
+
+  // Values, pc offsets of entries.
+  typedef std::multimap<uint64_t, int> EntryMap;
+  EntryMap entries_;
+
+  // Number of bytes taken up by the displacement of rip-relative addressing.
+  static constexpr int kRipRelativeDispSize = 4;  // 32-bit displacement.
+  // Distance between the address of the displacement in the rip-relative move
+  // instruction and the head address of the instruction.
+  static constexpr int kMoveRipRelativeDispOffset =
+      3;  // REX Opcode ModRM Displacement
+  // Distance between the address of the imm64 in the 'movq reg, imm64'
+  // instruction and the head address of the instruction.
+  static constexpr int kMoveImm64Offset = 2;  // REX Opcode imm64
+  // A mask for rip-relative move instruction.
+  static constexpr uint32_t kMoveRipRelativeMask = 0x00C7FFFB;
+  // The bits for a rip-relative move instruction after mask.
+  static constexpr uint32_t kMoveRipRelativeInstr = 0x00058B48;
+};
+
+class V8_EXPORT_PRIVATE Assembler : public AssemblerBase {
  private:
   // We check before assembling an instruction that there is sufficient
   // space to write an instruction and its relocation information.
@@ -449,9 +512,7 @@ class Assembler : public AssemblerBase {
   // buffer for code generation and assumes its size to be buffer_size. If the
   // buffer is too small, a fatal error occurs. No deallocation of the buffer is
   // done upon destruction of the assembler.
-  Assembler(Isolate* isolate, void* buffer, int buffer_size)
-      : Assembler(IsolateData(isolate), buffer, buffer_size) {}
-  Assembler(IsolateData isolate_data, void* buffer, int buffer_size);
+  Assembler(const AssemblerOptions& options, void* buffer, int buffer_size);
   virtual ~Assembler() {}
 
   // GetCode emits any pending (non-emitted) code and fills the descriptor
@@ -818,6 +879,8 @@ class Assembler : public AssemblerBase {
   void testw(Operand op, Register reg);
 
   // Bit operations.
+  void bswapl(Register dst);
+  void bswapq(Register dst);
   void bt(Operand dst, Register src);
   void bts(Operand dst, Register src);
   void bsrq(Register dst, Register src);
@@ -1895,6 +1958,12 @@ class Assembler : public AssemblerBase {
   void dp(uintptr_t data) { dq(data); }
   void dq(Label* label);
 
+  // Patch entries for partial constant pool.
+  void PatchConstPool();
+
+  // Check if use partial constant pool for this rmode.
+  static bool UseConstPoolFor(RelocInfo::Mode rmode);
+
   // Check if there is less than kGap bytes available in the buffer.
   // If this is the case, we need to grow the buffer before emitting
   // an instruction or relocation information.
@@ -1936,7 +2005,6 @@ class Assembler : public AssemblerBase {
   inline void emitp(Address x, RelocInfo::Mode rmode);
   inline void emitq(uint64_t x);
   inline void emitw(uint16_t x);
-  inline void emit_code_target(Handle<Code> target, RelocInfo::Mode rmode);
   inline void emit_runtime_entry(Address entry, RelocInfo::Mode rmode);
   inline void emit(Immediate x);
 
@@ -2359,6 +2427,8 @@ class Assembler : public AssemblerBase {
 
   bool is_optimizable_farjmp(int idx);
 
+  void AllocateAndInstallRequestedHeapObjects(Isolate* isolate);
+
   friend class EnsureSpace;
   friend class RegExpMacroAssemblerX64;
 
@@ -2370,25 +2440,14 @@ class Assembler : public AssemblerBase {
   // are already bound.
   std::deque<int> internal_reference_positions_;
 
-  std::vector<Handle<Code>> code_targets_;
-
-  // The following functions help with avoiding allocations of embedded heap
-  // objects during the code assembly phase. {RequestHeapObject} records the
-  // need for a future heap number allocation or code stub generation. After
-  // code assembly, {AllocateAndInstallRequestedHeapObjects} will allocate these
-  // objects and place them where they are expected (determined by the pc offset
-  // associated with each request). That is, for each request, it will patch the
-  // dummy heap object handle that we emitted during code assembly with the
-  // actual heap object handle.
-  void RequestHeapObject(HeapObjectRequest request);
-  void AllocateAndInstallRequestedHeapObjects(Isolate* isolate);
-
-  std::forward_list<HeapObjectRequest> heap_object_requests_;
-
   // Variables for this instance of assembler
   int farjmp_num_ = 0;
   std::deque<int> farjmp_positions_;
   std::map<Label*, std::vector<int>> label_farjmp_maps_;
+
+  ConstPool constpool_;
+
+  friend class ConstPool;
 };
 
 

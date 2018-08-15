@@ -1962,9 +1962,6 @@ static void TestBuildGraphForSimpleExpression(WasmOpcode opcode) {
   Isolate* isolate = CcTest::InitIsolateOnce();
   Zone zone(isolate->allocator(), ZONE_NAME);
   HandleScope scope(isolate);
-  // TODO(gdeepti): Enable this test for sign extension opcodes when lowering
-  // is enabled.
-  if (WasmOpcodes::IsSignExtensionOpcode(opcode)) return;
   // TODO(ahaas): Enable this test for anyref opcodes when code generation for
   // them is implemented.
   if (WasmOpcodes::IsAnyRefOpcode(opcode)) return;
@@ -2069,11 +2066,11 @@ WASM_EXEC_TEST(Int32Global) {
         WASM_SET_GLOBAL(0, WASM_I32_ADD(WASM_GET_GLOBAL(0), WASM_GET_LOCAL(0))),
         WASM_ZERO);
 
-  *global = 116;
+  WriteLittleEndianValue<int32_t>(global, 116);
   for (int i = 9; i < 444444; i += 111111) {
-    int32_t expected = *global + i;
+    int32_t expected = ReadLittleEndianValue<int32_t>(global) + i;
     r.Call(i);
-    CHECK_EQ(expected, *global);
+    CHECK_EQ(expected, ReadLittleEndianValue<int32_t>(global));
   }
 }
 
@@ -2091,16 +2088,17 @@ WASM_EXEC_TEST(Int32Globals_DontAlias) {
           WASM_GET_GLOBAL(g));
 
     // Check that reading/writing global number {g} doesn't alter the others.
-    *globals[g] = 116 * g;
+    WriteLittleEndianValue<int32_t>(globals[g], 116 * g);
     int32_t before[kNumGlobals];
     for (int i = 9; i < 444444; i += 111113) {
-      int32_t sum = *globals[g] + i;
-      for (int j = 0; j < kNumGlobals; ++j) before[j] = *globals[j];
+      int32_t sum = ReadLittleEndianValue<int32_t>(globals[g]) + i;
+      for (int j = 0; j < kNumGlobals; ++j)
+        before[j] = ReadLittleEndianValue<int32_t>(globals[j]);
       int32_t result = r.Call(i);
       CHECK_EQ(sum, result);
       for (int j = 0; j < kNumGlobals; ++j) {
         int32_t expected = j == g ? sum : before[j];
-        CHECK_EQ(expected, *globals[j]);
+        CHECK_EQ(expected, ReadLittleEndianValue<int32_t>(globals[j]));
       }
     }
   }
@@ -2115,11 +2113,11 @@ WASM_EXEC_TEST(Float32Global) {
                                WASM_F32_SCONVERT_I32(WASM_GET_LOCAL(0)))),
         WASM_ZERO);
 
-  *global = 1.25;
+  WriteLittleEndianValue<float>(global, 1.25);
   for (int i = 9; i < 4444; i += 1111) {
-    volatile float expected = *global + i;
+    volatile float expected = ReadLittleEndianValue<float>(global) + i;
     r.Call(i);
-    CHECK_EQ(expected, *global);
+    CHECK_EQ(expected, ReadLittleEndianValue<float>(global));
   }
 }
 
@@ -2132,11 +2130,11 @@ WASM_EXEC_TEST(Float64Global) {
                                WASM_F64_SCONVERT_I32(WASM_GET_LOCAL(0)))),
         WASM_ZERO);
 
-  *global = 1.25;
+  WriteLittleEndianValue<double>(global, 1.25);
   for (int i = 9; i < 4444; i += 1111) {
-    volatile double expected = *global + i;
+    volatile double expected = ReadLittleEndianValue<double>(global) + i;
     r.Call(i);
-    CHECK_EQ(expected, *global);
+    CHECK_EQ(expected, ReadLittleEndianValue<double>(global));
   }
 }
 
@@ -2167,10 +2165,13 @@ WASM_EXEC_TEST(MixedGlobals) {
   memory[7] = 0x99;
   r.Call(1);
 
-  CHECK(static_cast<int32_t>(0xEE55CCAA) == *var_int32);
-  CHECK(static_cast<uint32_t>(0xEE55CCAA) == *var_uint32);
-  CHECK(bit_cast<float>(0xEE55CCAA) == *var_float);
-  CHECK(bit_cast<double>(0x99112233EE55CCAAULL) == *var_double);
+  CHECK(static_cast<int32_t>(0xEE55CCAA) ==
+        ReadLittleEndianValue<int32_t>(var_int32));
+  CHECK(static_cast<uint32_t>(0xEE55CCAA) ==
+        ReadLittleEndianValue<uint32_t>(var_uint32));
+  CHECK(bit_cast<float>(0xEE55CCAA) == ReadLittleEndianValue<float>(var_float));
+  CHECK(bit_cast<double>(0x99112233EE55CCAAULL) ==
+        ReadLittleEndianValue<double>(var_double));
 
   USE(unused);
 }
@@ -3229,8 +3230,7 @@ void BinOpOnDifferentRegisters(
               ctype value =
                   i == lhs ? lhs_value
                            : i == rhs ? rhs_value : static_cast<ctype>(i + 47);
-              WriteLittleEndianValue<ctype>(
-                  reinterpret_cast<Address>(&memory[i]), value);
+              WriteLittleEndianValue<ctype>(&memory[i], value);
             }
             bool trap = false;
             int64_t expect = expect_fn(lhs_value, rhs_value, &trap);
@@ -3239,14 +3239,12 @@ void BinOpOnDifferentRegisters(
               continue;
             }
             CHECK_EQ(0, r.Call());
-            CHECK_EQ(expect, ReadLittleEndianValue<ctype>(
-                                 reinterpret_cast<Address>(&memory[0])));
+            CHECK_EQ(expect, ReadLittleEndianValue<ctype>(&memory[0]));
             for (int i = 0; i < num_locals; ++i) {
               ctype value =
                   i == lhs ? lhs_value
                            : i == rhs ? rhs_value : static_cast<ctype>(i + 47);
-              CHECK_EQ(value, ReadLittleEndianValue<ctype>(
-                                  reinterpret_cast<Address>(&memory[i + 1])));
+              CHECK_EQ(value, ReadLittleEndianValue<ctype>(&memory[i + 1]));
             }
           }
         }
@@ -3410,66 +3408,44 @@ WASM_EXEC_TEST(I64RemUOnDifferentRegisters) {
       });
 }
 
-TEST(Liftoff_prologue) {
-  // The tested prologue is only inserted in tiering mode. The prologue
-  // is responsible for jumping to the optimized, tiered up code if
-  // it exists.
-  FlagScope<bool> tier_up_scope(&v8::internal::FLAG_wasm_tier_up, true);
+TEST(Liftoff_tier_up) {
+  WasmRunner<int32_t, int32_t, int32_t> r(WasmExecutionMode::kExecuteLiftoff);
 
-  // The number of parameters define how many registers are used
-  // on a function call. The Liftoff-prologue has to make sure to
-  // correctly save prior, and restore all parameters
-  // after the prologue.
-  const uint8_t kNumParams = 4;
-  ValueType int_types[kNumParams + 1];
-  for (int i = 0; i < kNumParams + 1; i++) int_types[i] = kWasmI32;
-  FunctionSig sig_i_x(1, kNumParams, int_types);
+  WasmFunctionCompiler& add = r.NewFunction<int32_t, int32_t, int32_t>("add");
+  BUILD(add, WASM_I32_ADD(WASM_GET_LOCAL(0), WASM_GET_LOCAL(1)));
 
-  WasmRunner<int32_t, int32_t, int32_t, int32_t, int32_t> r(
-      WasmExecutionMode::kExecuteLiftoff);
+  WasmFunctionCompiler& sub = r.NewFunction<int32_t, int32_t, int32_t>("sub");
+  BUILD(sub, WASM_I32_SUB(WASM_GET_LOCAL(0), WASM_GET_LOCAL(1)));
 
-  // Define two functions: {add_locals} and {sub_locals}, whereas
-  // {sub_locals} shall be our mockup optimized code.
-  std::vector<byte> add_locals, sub_locals;
-  ADD_CODE(add_locals, WASM_I32_ADD(WASM_GET_LOCAL(0), WASM_GET_LOCAL(1)));
-  ADD_CODE(sub_locals, WASM_I32_SUB(WASM_GET_LOCAL(0), WASM_GET_LOCAL(1)));
-
-  for (int i = 2; i < kNumParams; ++i) {
-    ADD_CODE(add_locals, WASM_GET_LOCAL(i), kExprI32Add);
-    ADD_CODE(sub_locals, WASM_GET_LOCAL(i), kExprI32Sub);
-  }
-
-  WasmFunctionCompiler& add_compiler = r.NewFunction(&sig_i_x);
-  add_compiler.Build(&add_locals[0], &add_locals[0] + add_locals.size());
-
-  WasmFunctionCompiler& sub_compiler = r.NewFunction(&sig_i_x);
-  sub_compiler.Build(&sub_locals[0], &sub_locals[0] + sub_locals.size());
-
-  // Create a calling function, which shall call {add_locals}.
-  std::vector<byte> call;
-  for (int i = 0; i < kNumParams; ++i) {
-    ADD_CODE(call, WASM_GET_LOCAL(i));
-  }
-  ADD_CODE(call, kExprCallFunction,
-           static_cast<byte>(add_compiler.function_index()));
-  r.Build(&call[0], &call[0] + call.size());
+  // Create the main function, which shall call {add}.
+  BUILD(r, WASM_CALL_FUNCTION(add.function_index(), WASM_GET_LOCAL(0),
+                              WASM_GET_LOCAL(1)));
 
   NativeModule* native_module =
-      r.builder().instance_object()->compiled_module()->GetNativeModule();
+      r.builder().instance_object()->module_object()->native_module();
 
   // This test only works if we managed to compile with Liftoff.
-  if (native_module->code(add_compiler.function_index())->is_liftoff()) {
-    // First run should execute {add_locals}.
-    CHECK_EQ(10, r.Call(1, 2, 3, 4));
+  if (native_module->code(add.function_index())->is_liftoff()) {
+    // First run should execute {add}.
+    CHECK_EQ(18, r.Call(11, 7));
 
-    // Update the native_module to contain the "optimized" code ({sub_locals}).
-    native_module->SetCodeForTesting(
-        add_compiler.function_index(),
-        native_module->code(sub_compiler.function_index()));
+    // Now make a copy of the {sub} function, and add it to the native module at
+    // the index of {add}.
+    CodeDesc desc;
+    memset(&desc, 0, sizeof(CodeDesc));
+    WasmCode* sub_code = native_module->code(sub.function_index());
+    size_t sub_size = sub_code->instructions().size();
+    std::unique_ptr<byte[]> buffer(new byte[sub_code->instructions().size()]);
+    memcpy(buffer.get(), sub_code->instructions().start(), sub_size);
+    desc.buffer = buffer.get();
+    desc.instr_size = static_cast<int>(sub_size);
+    WasmCode* code =
+        native_module->AddCode(add.function_index(), desc, 0, 0, 0, {},
+                               OwnedVector<byte>(), WasmCode::kOther);
+    native_module->PublishCode(code);
 
-    // Second run should execute {add_locals}, which should detect that
-    // the code was updated, and run {sub_locals}.
-    CHECK_EQ(-8, r.Call(1, 2, 3, 4));
+    // Second run should now execute {sub}.
+    CHECK_EQ(4, r.Call(11, 7));
   }
 }
 

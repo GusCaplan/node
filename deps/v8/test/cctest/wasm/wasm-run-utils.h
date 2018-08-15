@@ -26,7 +26,6 @@
 #include "src/wasm/function-body-decoder.h"
 #include "src/wasm/local-decl-encoder.h"
 #include "src/wasm/wasm-code-manager.h"
-#include "src/wasm/wasm-code-specialization.h"
 #include "src/wasm/wasm-external-refs.h"
 #include "src/wasm/wasm-interpreter.h"
 #include "src/wasm/wasm-js.h"
@@ -54,8 +53,6 @@ enum WasmExecutionMode {
   kExecuteTurbofan,
   kExecuteLiftoff
 };
-
-enum LowerSimd : bool { kLowerSimd = true, kNoLowerSimd = false };
 
 using compiler::CallDescriptor;
 using compiler::MachineTypeForC;
@@ -87,18 +84,18 @@ struct ManuallyImportedJSFunction {
 
 // A  Wasm module builder. Globals are pre-set, however, memory and code may be
 // progressively added by a test. In turn, we piecemeal update the runtime
-// objects, i.e. {WasmInstanceObject}, {WasmCompiledModule} and, if necessary,
+// objects, i.e. {WasmInstanceObject}, {WasmModuleObject} and, if necessary,
 // the interpreter.
 class TestingModuleBuilder {
  public:
   TestingModuleBuilder(Zone*, ManuallyImportedJSFunction*, WasmExecutionMode,
                        RuntimeExceptionSupport, LowerSimd);
 
-  void ChangeOriginToAsmjs() { test_module_->set_origin(kAsmJsOrigin); }
+  void ChangeOriginToAsmjs() { test_module_->origin = kAsmJsOrigin; }
 
   byte* AddMemory(uint32_t size);
 
-  size_t CodeTableLength() const { return native_module_->function_count(); }
+  size_t CodeTableLength() const { return native_module_->num_functions(); }
 
   template <typename T>
   T* AddMemoryElems(uint32_t count) {
@@ -117,7 +114,7 @@ class TestingModuleBuilder {
     DCHECK_EQ(test_module_->signatures.size(),
               test_module_->signature_ids.size());
     test_module_->signatures.push_back(sig);
-    auto canonical_sig_num = test_module_->signature_map.FindOrInsert(sig);
+    auto canonical_sig_num = test_module_->signature_map.FindOrInsert(*sig);
     test_module_->signature_ids.push_back(canonical_sig_num);
     size_t size = test_module_->signatures.size();
     CHECK_GT(127, size);
@@ -181,7 +178,8 @@ class TestingModuleBuilder {
 
   void SetHasSharedMemory() { test_module_->has_shared_memory = true; }
 
-  uint32_t AddFunction(FunctionSig* sig, const char* name);
+  enum FunctionType { kImport, kWasm };
+  uint32_t AddFunction(FunctionSig* sig, const char* name, FunctionType type);
 
   Handle<JSFunction> WrapCode(uint32_t index);
 
@@ -203,21 +201,16 @@ class TestingModuleBuilder {
   Handle<WasmInstanceObject> instance_object() const {
     return instance_object_;
   }
-  wasm::WasmCode* GetFunctionCode(uint32_t index) const {
+  WasmCode* GetFunctionCode(uint32_t index) const {
     return native_module_->code(index);
   }
   Address globals_start() const {
     return reinterpret_cast<Address>(globals_data_);
   }
   void Link() {
-    if (!linked_) {
-      Handle<WasmModuleObject> module(instance_object()->module_object());
-      CodeSpecialization code_specialization;
-      code_specialization.RelocateDirectCalls(native_module_);
-      code_specialization.ApplyToWholeModule(native_module_, module);
-      linked_ = true;
-      native_module_->SetExecutable(true);
-    }
+    if (linked_) return;
+    linked_ = true;
+    native_module_->SetExecutable(true);
   }
 
   ModuleEnv CreateModuleEnv();
@@ -232,6 +225,7 @@ class TestingModuleBuilder {
   std::shared_ptr<WasmModule> test_module_;
   WasmModule* test_module_ptr_;
   Isolate* isolate_;
+  WasmFeatures enabled_features_;
   uint32_t global_offset = 0;
   byte* mem_start_ = nullptr;
   uint32_t mem_size_ = 0;
@@ -270,14 +264,15 @@ class WasmFunctionWrapper : private compiler::GraphAndBuilders {
     Init(call_descriptor, MachineTypeForC<ReturnType>(), param_vec);
   }
 
-  void SetInnerCode(wasm::WasmCode* code) {
+  void SetInnerCode(WasmCode* code) {
     intptr_t address = static_cast<intptr_t>(code->instruction_start());
     compiler::NodeProperties::ChangeOp(
         inner_code_node_,
         kPointerSize == 8
-            ? common()->RelocatableInt64Constant(address, RelocInfo::WASM_CALL)
+            ? common()->RelocatableInt64Constant(address,
+                                                 RelocInfo::JS_TO_WASM_CALL)
             : common()->RelocatableInt32Constant(static_cast<int>(address),
-                                                 RelocInfo::WASM_CALL));
+                                                 RelocInfo::JS_TO_WASM_CALL));
   }
 
   const compiler::Operator* IntPtrConstant(intptr_t value) {
@@ -298,7 +293,7 @@ class WasmFunctionWrapper : private compiler::GraphAndBuilders {
  private:
   Node* inner_code_node_;
   Node* context_address_;
-  Handle<Code> code_;
+  MaybeHandle<Code> code_;
   Signature<MachineType>* signature_;
 };
 

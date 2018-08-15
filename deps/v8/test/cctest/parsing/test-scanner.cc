@@ -21,13 +21,13 @@ const char src_simple[] = "function foo() { var x = 2 * a() + b; }";
 
 struct ScannerTestHelper {
   ScannerTestHelper() = default;
-  ScannerTestHelper(ScannerTestHelper&& other)
+  ScannerTestHelper(ScannerTestHelper&& other) V8_NOEXCEPT
       : unicode_cache(std::move(other.unicode_cache)),
         stream(std::move(other.stream)),
         scanner(std::move(other.scanner)) {}
 
   std::unique_ptr<UnicodeCache> unicode_cache;
-  std::unique_ptr<Utf16CharacterStream> stream;
+  std::unique_ptr<CharacterStream<uint16_t>> stream;
   std::unique_ptr<Scanner> scanner;
 
   Scanner* operator->() const { return scanner.get(); }

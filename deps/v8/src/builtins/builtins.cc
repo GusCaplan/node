@@ -3,10 +3,12 @@
 // found in the LICENSE file.
 
 #include "src/builtins/builtins.h"
-#include "src/api.h"
+
+#include "src/api-inl.h"
 #include "src/assembler-inl.h"
 #include "src/builtins/builtins-descriptors.h"
 #include "src/callable.h"
+#include "src/instruction-stream.h"
 #include "src/isolate.h"
 #include "src/macro-assembler.h"
 #include "src/objects-inl.h"
@@ -65,12 +67,6 @@ const BuiltinMetadata builtin_metadata[] = {
 
 }  // namespace
 
-Builtins::Builtins() : initialized_(false) {
-  memset(builtins_, 0, sizeof(builtins_[0]) * builtin_count);
-}
-
-Builtins::~Builtins() {}
-
 BailoutId Builtins::GetContinuationBailoutId(Name name) {
   DCHECK(Builtins::KindOf(name) == TFJ || Builtins::KindOf(name) == TFC);
   return BailoutId(BailoutId::kFirstBuiltinContinuationId + name);
@@ -85,18 +81,17 @@ Builtins::Name Builtins::GetBuiltinFromBailoutId(BailoutId id) {
 
 void Builtins::TearDown() { initialized_ = false; }
 
-void Builtins::IterateBuiltins(RootVisitor* v) {
-  for (int i = 0; i < builtin_count; i++) {
-    v->VisitRootPointer(Root::kBuiltins, name(i), &builtins_[i]);
-  }
-}
-
 const char* Builtins::Lookup(Address pc) {
-  // may be called during initialization (disassembler!)
+  // Off-heap pc's can be looked up through binary search.
+  if (FLAG_embedded_builtins) {
+    Code* maybe_builtin = InstructionStream::TryLookupCode(isolate_, pc);
+    if (maybe_builtin != nullptr) return name(maybe_builtin->builtin_index());
+  }
+
+  // May be called during initialization (disassembler).
   if (initialized_) {
     for (int i = 0; i < builtin_count; i++) {
-      Code* entry = Code::cast(builtins_[i]);
-      if (entry->contains(pc)) return name(i);
+      if (isolate_->heap()->builtin(i)->contains(pc)) return name(i);
     }
   }
   return nullptr;
@@ -137,16 +132,15 @@ Handle<Code> Builtins::OrdinaryToPrimitive(OrdinaryToPrimitiveHint hint) {
 }
 
 void Builtins::set_builtin(int index, HeapObject* builtin) {
-  DCHECK(Builtins::IsBuiltinId(index));
-  DCHECK(Internals::HasHeapObjectTag(builtin));
-  // The given builtin may be completely uninitialized thus we cannot check its
-  // type here.
-  builtins_[index] = builtin;
+  isolate_->heap()->set_builtin(index, builtin);
 }
+
+Code* Builtins::builtin(int index) { return isolate_->heap()->builtin(index); }
 
 Handle<Code> Builtins::builtin_handle(int index) {
   DCHECK(IsBuiltinId(index));
-  return Handle<Code>(reinterpret_cast<Code**>(builtin_address(index)));
+  return Handle<Code>(
+      reinterpret_cast<Code**>(isolate_->heap()->builtin_address(index)));
 }
 
 // static
@@ -157,8 +151,7 @@ int Builtins::GetStackParameterCount(Name name) {
 
 // static
 Callable Builtins::CallableFor(Isolate* isolate, Name name) {
-  Handle<Code> code(
-      reinterpret_cast<Code**>(isolate->builtins()->builtin_address(name)));
+  Handle<Code> code = isolate->builtins()->builtin_handle(name);
   CallDescriptors::Key key;
   switch (name) {
 // This macro is deliberately crafted so as to emit very little code,
@@ -174,11 +167,11 @@ Callable Builtins::CallableFor(Isolate* isolate, Name name) {
     default:
       Builtins::Kind kind = Builtins::KindOf(name);
       if (kind == TFJ || kind == CPP) {
-        return Callable(code, BuiltinDescriptor(isolate));
+        return Callable(code, JSTrampolineDescriptor{});
       }
       UNREACHABLE();
   }
-  CallInterfaceDescriptor descriptor(isolate, key);
+  CallInterfaceDescriptor descriptor(key);
   return Callable(code, descriptor);
 }
 
@@ -199,24 +192,38 @@ bool Builtins::IsBuiltin(const Code* code) {
   return Builtins::IsBuiltinId(code->builtin_index());
 }
 
+bool Builtins::IsBuiltinHandle(Handle<HeapObject> maybe_code,
+                               int* index) const {
+  Heap* heap = isolate_->heap();
+  Address handle_location = maybe_code.address();
+  Address start = heap->builtin_address(0);
+  Address end = heap->builtin_address(Builtins::builtin_count);
+  if (handle_location >= end) return false;
+  if (handle_location < start) return false;
+  *index = static_cast<int>(handle_location - start) >> kPointerSizeLog2;
+  DCHECK(Builtins::IsBuiltinId(*index));
+  return true;
+}
+
 // static
-bool Builtins::IsEmbeddedBuiltin(const Code* code) {
-#ifdef V8_EMBEDDED_BUILTINS
-  return Builtins::IsBuiltinId(code->builtin_index()) &&
-         Builtins::IsIsolateIndependent(code->builtin_index());
-#else
-  return false;
-#endif
+bool Builtins::IsIsolateIndependentBuiltin(const Code* code) {
+  if (FLAG_embedded_builtins) {
+    const int builtin_index = code->builtin_index();
+    return Builtins::IsBuiltinId(builtin_index) &&
+           Builtins::IsIsolateIndependent(builtin_index);
+  } else {
+    return false;
+  }
 }
 
 // static
 bool Builtins::IsLazy(int index) {
   DCHECK(IsBuiltinId(index));
 
-#ifdef V8_EMBEDDED_BUILTINS
-  // We don't want to lazy-deserialize off-heap builtins.
-  if (Builtins::IsIsolateIndependent(index)) return false;
-#endif
+  if (FLAG_embedded_builtins) {
+    // We don't want to lazy-deserialize off-heap builtins.
+    if (Builtins::IsIsolateIndependent(index)) return false;
+  }
 
   // There are a couple of reasons that builtins can require eager-loading,
   // i.e. deserialization at isolate creation instead of on-demand. For
@@ -288,7 +295,7 @@ bool Builtins::IsLazy(int index) {
     case kThrowWasmTrapUnreachable:           // Required by wasm.
     case kToBooleanLazyDeoptContinuation:
     case kToNumber:                           // Required by wasm.
-    case kTypedArrayConstructorLazyDeoptContinuation:
+    case kGenericConstructorLazyDeoptContinuation:
     case kWasmCompileLazy:                    // Required by wasm.
     case kWasmStackGuard:                     // Required by wasm.
       return false;
@@ -302,22 +309,27 @@ bool Builtins::IsLazy(int index) {
 // static
 bool Builtins::IsIsolateIndependent(int index) {
   DCHECK(IsBuiltinId(index));
-  // TODO(jgruber): There's currently two blockers for moving
-  // InterpreterEntryTrampoline into the binary:
-  // 1. InterpreterEnterBytecode calculates a pointer into the middle of
-  //    InterpreterEntryTrampoline (see interpreter_entry_return_pc_offset).
-  //    When the builtin is embedded, the pointer would need to be calculated
-  //    at an offset from the embedded instruction stream (instead of the
-  //    trampoline code object).
-  // 2. We create distinct copies of the trampoline to make it possible to
-  //    attribute ticks in the interpreter to individual JS functions.
-  //    See https://crrev.com/c/959081 and InstallBytecodeArray. When the
-  //    trampoline is embedded, we need to ensure that CopyCode creates a copy
-  //    of the builtin itself (and not just the trampoline).
-  return index != kInterpreterEntryTrampoline;
+  switch (index) {
+    // TODO(jgruber): There's currently two blockers for moving
+    // InterpreterEntryTrampoline into the binary:
+    // 1. InterpreterEnterBytecode calculates a pointer into the middle of
+    //    InterpreterEntryTrampoline (see interpreter_entry_return_pc_offset).
+    //    When the builtin is embedded, the pointer would need to be calculated
+    //    at an offset from the embedded instruction stream (instead of the
+    //    trampoline code object).
+    // 2. We create distinct copies of the trampoline to make it possible to
+    //    attribute ticks in the interpreter to individual JS functions.
+    //    See https://crrev.com/c/959081 and InstallBytecodeArray. When the
+    //    trampoline is embedded, we need to ensure that CopyCode creates a copy
+    //    of the builtin itself (and not just the trampoline).
+    case kInterpreterEntryTrampoline:
+      return false;
+    default:
+      return true;
+  }
+  UNREACHABLE();
 }
 
-#ifdef V8_EMBEDDED_BUILTINS
 // static
 Handle<Code> Builtins::GenerateOffHeapTrampolineFor(Isolate* isolate,
                                                     Address off_heap_entry) {
@@ -341,7 +353,6 @@ Handle<Code> Builtins::GenerateOffHeapTrampolineFor(Isolate* isolate,
 
   return isolate->factory()->NewCode(desc, Code::BUILTIN, masm.CodeObject());
 }
-#endif  // V8_EMBEDDED_BUILTINS
 
 // static
 Builtins::Kind Builtins::KindOf(int index) {

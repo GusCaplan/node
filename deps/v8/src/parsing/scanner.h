@@ -12,6 +12,7 @@
 #include "src/char-predicates.h"
 #include "src/globals.h"
 #include "src/messages.h"
+#include "src/parsing/scanner-character-streams.h"
 #include "src/parsing/token.h"
 #include "src/unicode-decoder.h"
 #include "src/unicode.h"
@@ -27,136 +28,6 @@ class ExternalOneByteString;
 class ExternalTwoByteString;
 class ParserRecorder;
 class UnicodeCache;
-
-// ---------------------------------------------------------------------
-// Buffered stream of UTF-16 code units, using an internal UTF-16 buffer.
-// A code unit is a 16 bit value representing either a 16 bit code point
-// or one part of a surrogate pair that make a single 21 bit code point.
-class Utf16CharacterStream {
- public:
-  static const uc32 kEndOfInput = -1;
-
-  virtual ~Utf16CharacterStream() { }
-
-  // Returns and advances past the next UTF-16 code unit in the input
-  // stream. If there are no more code units it returns kEndOfInput.
-  inline uc32 Advance() {
-    if (V8_LIKELY(buffer_cursor_ < buffer_end_)) {
-      return static_cast<uc32>(*(buffer_cursor_++));
-    } else if (ReadBlockChecked()) {
-      return static_cast<uc32>(*(buffer_cursor_++));
-    } else {
-      // Note: currently the following increment is necessary to avoid a
-      // parser problem! The scanner treats the final kEndOfInput as
-      // a code unit with a position, and does math relative to that
-      // position.
-      buffer_cursor_++;
-      return kEndOfInput;
-    }
-  }
-
-  // Go back one by one character in the input stream.
-  // This undoes the most recent Advance().
-  inline void Back() {
-    // The common case - if the previous character is within
-    // buffer_start_ .. buffer_end_ will be handles locally.
-    // Otherwise, a new block is requested.
-    if (V8_LIKELY(buffer_cursor_ > buffer_start_)) {
-      buffer_cursor_--;
-    } else {
-      ReadBlockAt(pos() - 1);
-    }
-  }
-
-  // Go back one by two characters in the input stream. (This is the same as
-  // calling Back() twice. But Back() may - in some instances - do substantial
-  // work. Back2() guarantees this work will be done only once.)
-  inline void Back2() {
-    if (V8_LIKELY(buffer_cursor_ - 2 >= buffer_start_)) {
-      buffer_cursor_ -= 2;
-    } else {
-      ReadBlockAt(pos() - 2);
-    }
-  }
-
-  inline size_t pos() const {
-    return buffer_pos_ + (buffer_cursor_ - buffer_start_);
-  }
-
-  inline void Seek(size_t pos) {
-    if (V8_LIKELY(pos >= buffer_pos_ &&
-                  pos < (buffer_pos_ + (buffer_end_ - buffer_start_)))) {
-      buffer_cursor_ = buffer_start_ + (pos - buffer_pos_);
-    } else {
-      ReadBlockAt(pos);
-    }
-  }
-
-  // Returns true if the stream could access the V8 heap after construction.
-  virtual bool can_access_heap() = 0;
-
- protected:
-  Utf16CharacterStream(const uint16_t* buffer_start,
-                       const uint16_t* buffer_cursor,
-                       const uint16_t* buffer_end, size_t buffer_pos)
-      : buffer_start_(buffer_start),
-        buffer_cursor_(buffer_cursor),
-        buffer_end_(buffer_end),
-        buffer_pos_(buffer_pos) {}
-  Utf16CharacterStream() : Utf16CharacterStream(nullptr, nullptr, nullptr, 0) {}
-
-  bool ReadBlockChecked() {
-    size_t position = pos();
-    USE(position);
-    bool success = ReadBlock();
-
-    // Post-conditions: 1, We should always be at the right position.
-    //                  2, Cursor should be inside the buffer.
-    //                  3, We should have more characters available iff success.
-    DCHECK_EQ(pos(), position);
-    DCHECK_LE(buffer_cursor_, buffer_end_);
-    DCHECK_LE(buffer_start_, buffer_cursor_);
-    DCHECK_EQ(success, buffer_cursor_ < buffer_end_);
-    return success;
-  }
-
-  void ReadBlockAt(size_t new_pos) {
-    // The callers of this method (Back/Back2/Seek) should handle the easy
-    // case (seeking within the current buffer), and we should only get here
-    // if we actually require new data.
-    // (This is really an efficiency check, not a correctness invariant.)
-    DCHECK(new_pos < buffer_pos_ ||
-           new_pos >= buffer_pos_ + (buffer_end_ - buffer_start_));
-
-    // Change pos() to point to new_pos.
-    buffer_pos_ = new_pos;
-    buffer_cursor_ = buffer_start_;
-    DCHECK_EQ(pos(), new_pos);
-    ReadBlockChecked();
-  }
-
-  // Read more data, and update buffer_*_ to point to it.
-  // Returns true if more data was available.
-  //
-  // ReadBlock() may modify any of the buffer_*_ members, but must sure that
-  // the result of pos() remains unaffected.
-  //
-  // Examples:
-  // - a stream could either fill a separate buffer. Then buffer_start_ and
-  //   buffer_cursor_ would point to the beginning of the buffer, and
-  //   buffer_pos would be the old pos().
-  // - a stream with existing buffer chunks would set buffer_start_ and
-  //   buffer_end_ to cover the full chunk, and then buffer_cursor_ would
-  //   point into the middle of the buffer, while buffer_pos_ would describe
-  //   the start of the buffer.
-  virtual bool ReadBlock() = 0;
-
-  const uint16_t* buffer_start_;
-  const uint16_t* buffer_cursor_;
-  const uint16_t* buffer_end_;
-  size_t buffer_pos_;
-};
-
 
 // ----------------------------------------------------------------------------
 // JavaScript Scanner.
@@ -205,11 +76,11 @@ class Scanner {
 
   // -1 is outside of the range of any real source code.
   static const int kNoOctalLocation = -1;
-  static const uc32 kEndOfInput = Utf16CharacterStream::kEndOfInput;
+  static const uc32 kEndOfInput = ScannerStream::kEndOfInput;
 
   explicit Scanner(UnicodeCache* scanner_contants);
 
-  void Initialize(Utf16CharacterStream* source, bool is_module);
+  void Initialize(CharacterStream<uint16_t>* source, bool is_module);
 
   // Returns the next token and advances input.
   Token::Value Next();
@@ -403,18 +274,20 @@ class Scanner {
 
     ~LiteralBuffer() { backing_store_.Dispose(); }
 
-    INLINE(void AddChar(char code_unit)) {
+    V8_INLINE void AddChar(char code_unit) {
       DCHECK(IsValidAscii(code_unit));
       AddOneByteChar(static_cast<byte>(code_unit));
     }
 
-    INLINE(void AddChar(uc32 code_unit)) {
-      if (is_one_byte_ &&
-          code_unit <= static_cast<uc32>(unibrow::Latin1::kMaxChar)) {
-        AddOneByteChar(static_cast<byte>(code_unit));
-      } else {
-        AddCharSlow(code_unit);
+    V8_INLINE void AddChar(uc32 code_unit) {
+      if (is_one_byte_) {
+        if (code_unit <= static_cast<uc32>(unibrow::Latin1::kMaxChar)) {
+          AddOneByteChar(static_cast<byte>(code_unit));
+          return;
+        }
+        ConvertToTwoByte();
       }
+      AddTwoByteChar(code_unit);
     }
 
     bool is_one_byte() const { return is_one_byte_; }
@@ -440,10 +313,6 @@ class Scanner {
 
     int length() const { return is_one_byte_ ? position_ : (position_ >> 1); }
 
-    void ReduceLength(int delta) {
-      position_ -= delta * (is_one_byte_ ? kOneByteSize : kUC16Size);
-    }
-
     void Reset() {
       position_ = 0;
       is_one_byte_ = true;
@@ -465,14 +334,14 @@ class Scanner {
       return iscntrl(code_unit) || isprint(code_unit);
     }
 
-    INLINE(void AddOneByteChar(byte one_byte_char)) {
+    V8_INLINE void AddOneByteChar(byte one_byte_char) {
       DCHECK(is_one_byte_);
       if (position_ >= backing_store_.length()) ExpandBuffer();
       backing_store_[position_] = one_byte_char;
       position_ += kOneByteSize;
     }
 
-    void AddCharSlow(uc32 code_unit);
+    void AddTwoByteChar(uc32 code_unit);
     int NewCapacity(int min_capacity);
     void ExpandBuffer();
     void ConvertToTwoByte();
@@ -510,7 +379,7 @@ class Scanner {
 
   // Scans octal escape sequence. Also accepts "\0" decimal escape sequence.
   template <bool capture_raw>
-  uc32 ScanOctalEscape(uc32 c, int length, bool in_template_literal);
+  uc32 ScanOctalEscape(uc32 c, int length);
 
   // Call this after setting source_ to the input.
   void Init() {
@@ -575,24 +444,19 @@ class Scanner {
     next_.raw_literal_chars = free_buffer;
   }
 
-  INLINE(void AddLiteralChar(uc32 c)) {
+  V8_INLINE void AddLiteralChar(uc32 c) {
     DCHECK_NOT_NULL(next_.literal_chars);
     next_.literal_chars->AddChar(c);
   }
 
-  INLINE(void AddLiteralChar(char c)) {
+  V8_INLINE void AddLiteralChar(char c) {
     DCHECK_NOT_NULL(next_.literal_chars);
     next_.literal_chars->AddChar(c);
   }
 
-  INLINE(void AddRawLiteralChar(uc32 c)) {
+  V8_INLINE void AddRawLiteralChar(uc32 c) {
     DCHECK_NOT_NULL(next_.raw_literal_chars);
     next_.raw_literal_chars->AddChar(c);
-  }
-
-  INLINE(void ReduceRawLiteralLength(int delta)) {
-    DCHECK_NOT_NULL(next_.raw_literal_chars);
-    next_.raw_literal_chars->ReduceLength(delta);
   }
 
   // Stops scanning of a literal and drop the collected characters,
@@ -608,24 +472,31 @@ class Scanner {
   }
 
   // Low-level scanning support.
-  template <bool capture_raw = false, bool check_surrogate = true>
+  template <bool capture_raw = false>
   void Advance() {
     if (capture_raw) {
       AddRawLiteralChar(c0_);
     }
     c0_ = source_->Advance();
-    if (check_surrogate) HandleLeadSurrogate();
   }
 
-  void HandleLeadSurrogate() {
+  template <typename FunctionType>
+  V8_INLINE void AdvanceUntil(FunctionType check) {
+    c0_ = source_->AdvanceUntil(check);
+  }
+
+  bool CombineSurrogatePair() {
+    DCHECK(!unibrow::Utf16::IsLeadSurrogate(kEndOfInput));
     if (unibrow::Utf16::IsLeadSurrogate(c0_)) {
       uc32 c1 = source_->Advance();
-      if (!unibrow::Utf16::IsTrailSurrogate(c1)) {
-        source_->Back();
-      } else {
+      DCHECK(!unibrow::Utf16::IsTrailSurrogate(kEndOfInput));
+      if (unibrow::Utf16::IsTrailSurrogate(c1)) {
         c0_ = unibrow::Utf16::CombineSurrogatePair(c0_, c1);
+        return true;
       }
+      source_->Back();
     }
+    return false;
   }
 
   void PushBack(uc32 ch) {
@@ -726,7 +597,9 @@ class Scanner {
   // Scans a single JavaScript token.
   void Scan();
 
-  Token::Value SkipWhiteSpace();
+  V8_INLINE Token::Value SkipWhiteSpace();
+  V8_INLINE void SkipWhiteSpaceImpl();
+  Token::Value TryToSkipHTMLCommentAndWhiteSpaces(int start_position);
   Token::Value SkipSingleHTMLComment();
   Token::Value SkipSingleLineComment();
   Token::Value SkipSourceURLComment();
@@ -750,7 +623,6 @@ class Scanner {
   Token::Value ScanNumber(bool seen_period);
   Token::Value ScanIdentifierOrKeyword();
   Token::Value ScanIdentifierOrKeywordInner(LiteralScope* literal);
-  Token::Value ScanIdentifierSuffix(LiteralScope* literal, bool escaped);
 
   Token::Value ScanString();
   Token::Value ScanPrivateName();
@@ -758,7 +630,7 @@ class Scanner {
   // Scans an escape-sequence which is part of a string and adds the
   // decoded character to the current literal. Returns true if a pattern
   // is scanned.
-  template <bool capture_raw, bool in_template_literal>
+  template <bool capture_raw>
   bool ScanEscape();
 
   // Decodes a Unicode escape-sequence which is part of an identifier.
@@ -812,8 +684,8 @@ class Scanner {
   TokenDesc next_;       // desc for next token (one token look-ahead)
   TokenDesc next_next_;  // desc for the token after next (after PeakAhead())
 
-  // Input stream. Must be initialized to an Utf16CharacterStream.
-  Utf16CharacterStream* source_;
+  // Input stream. Must be initialized to a CharacterStream.
+  CharacterStream<uint16_t>* source_;
 
   // Last-seen positions of potentially problematic tokens.
   Location octal_pos_;

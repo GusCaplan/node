@@ -94,6 +94,9 @@ class JSArray : public JSObject {
        AllocationMemento::kSize) >>
       kDoubleSizeLog2;
 
+  // Valid array indices range from +0 <= i < 2^32 - 1 (kMaxUInt32).
+  static const uint32_t kMaxArrayIndex = kMaxUInt32 - 1;
+
  private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(JSArray);
 };
@@ -170,23 +173,17 @@ class JSArrayBuffer : public JSObject {
 
   void Neuter();
 
-  inline ArrayBuffer::Allocator::AllocationMode allocation_mode() const;
-
   struct Allocation {
-    using AllocationMode = ArrayBuffer::Allocator::AllocationMode;
-
     Allocation(void* allocation_base, size_t length, void* backing_store,
-               AllocationMode mode, bool is_wasm_memory)
+               bool is_wasm_memory)
         : allocation_base(allocation_base),
           length(length),
           backing_store(backing_store),
-          mode(mode),
           is_wasm_memory(is_wasm_memory) {}
 
     void* allocation_base;
     size_t length;
     void* backing_store;
-    AllocationMode mode;
     bool is_wasm_memory;
   };
 
@@ -195,6 +192,10 @@ class JSArrayBuffer : public JSObject {
 
   // Sets whether the buffer is tracked by the WasmMemoryTracker.
   void set_is_wasm_memory(bool is_wasm_memory);
+
+  // Removes the backing store from the WasmMemoryTracker and sets
+  // |is_wasm_memory| to false.
+  void StopTrackingWasmMemory(Isolate* isolate);
 
   void FreeBackingStoreFromMainThread();
   static void FreeBackingStore(Isolate* isolate, Allocation allocation);
@@ -282,7 +283,7 @@ class JSTypedArray : public JSArrayBufferView {
  public:
   // [length]: length of typed array in elements.
   DECL_ACCESSORS(length, Object)
-  inline uint32_t length_value() const;
+  inline size_t length_value() const;
 
   // ES6 9.4.5.3
   V8_WARN_UNUSED_RESULT static Maybe<bool> DefineOwnProperty(

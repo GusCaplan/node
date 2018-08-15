@@ -49,6 +49,16 @@ class Arm64OperandGenerator final : public OperandGenerator {
     return UseRegister(node);
   }
 
+  // Use the stack pointer if the node is LoadStackPointer, otherwise assign a
+  // register.
+  InstructionOperand UseRegisterOrStackPointer(Node* node, bool sp_allowed) {
+    if (sp_allowed && node->opcode() == IrOpcode::kLoadStackPointer)
+      return LocationOperand(LocationOperand::EXPLICIT,
+                             LocationOperand::REGISTER,
+                             MachineRepresentation::kWord64, sp.code());
+    return UseRegister(node);
+  }
+
   // Use the provided node if it has the required value, or create a
   // TempImmediate otherwise.
   InstructionOperand UseImmediateOrTemp(Node* node, int32_t value) {
@@ -550,6 +560,27 @@ void EmitLoad(InstructionSelector* selector, Node* node, InstructionCode opcode,
   // If output is not nullptr, use that as the output register. This
   // is used when we merge a conversion into the load.
   outputs[0] = g.DefineAsRegister(output == nullptr ? node : output);
+
+  if (selector->CanAddressRelativeToRootsRegister()) {
+    ExternalReferenceMatcher m(base);
+    if (m.HasValue() && g.IsIntegerConstant(index)) {
+      ptrdiff_t const delta =
+          g.GetIntegerConstantValue(index) +
+          TurboAssemblerBase::RootRegisterOffsetForExternalReference(
+              selector->isolate(), m.Value());
+      input_count = 1;
+      // Check that the delta is a 32-bit integer due to the limitations of
+      // immediate operands.
+      if (is_int32(delta)) {
+        inputs[0] = g.UseImmediate(static_cast<int32_t>(delta));
+        opcode |= AddressingModeField::encode(kMode_Root);
+        selector->Emit(opcode, arraysize(outputs), outputs, input_count,
+                       inputs);
+        return;
+      }
+    }
+  }
+
   inputs[0] = g.UseRegister(base);
 
   if (g.CanBeImmediate(index, immediate_mode)) {
@@ -1158,6 +1189,8 @@ void InstructionSelector::VisitWord64Ror(Node* node) {
   V(Word32Clz, kArm64Clz32)                                   \
   V(Word32ReverseBits, kArm64Rbit32)                          \
   V(Word64ReverseBits, kArm64Rbit)                            \
+  V(Word32ReverseBytes, kArm64Rev32)                          \
+  V(Word64ReverseBytes, kArm64Rev)                            \
   V(ChangeFloat32ToFloat64, kArm64Float32ToFloat64)           \
   V(RoundInt32ToFloat32, kArm64Int32ToFloat32)                \
   V(RoundUint32ToFloat32, kArm64Uint32ToFloat32)              \
@@ -1240,10 +1273,6 @@ RRR_OP_LIST(RRR_VISITOR)
 void InstructionSelector::VisitWord32Ctz(Node* node) { UNREACHABLE(); }
 
 void InstructionSelector::VisitWord64Ctz(Node* node) { UNREACHABLE(); }
-
-void InstructionSelector::VisitWord64ReverseBytes(Node* node) { UNREACHABLE(); }
-
-void InstructionSelector::VisitWord32ReverseBytes(Node* node) { UNREACHABLE(); }
 
 void InstructionSelector::VisitWord32Popcnt(Node* node) { UNREACHABLE(); }
 
@@ -1747,17 +1776,21 @@ void VisitWordCompare(InstructionSelector* selector, Node* node,
   Node* left = node->InputAt(0);
   Node* right = node->InputAt(1);
 
+  if (right->opcode() == IrOpcode::kLoadStackPointer ||
+      g.CanBeImmediate(left, immediate_mode)) {
+    if (!commutative) cont->Commute();
+    std::swap(left, right);
+  }
+
   // Match immediates on left or right side of comparison.
   if (g.CanBeImmediate(right, immediate_mode)) {
-    VisitCompare(selector, opcode, g.UseRegister(left), g.UseImmediate(right),
-                 cont);
-  } else if (g.CanBeImmediate(left, immediate_mode)) {
-    if (!commutative) cont->Commute();
-    VisitCompare(selector, opcode, g.UseRegister(right), g.UseImmediate(left),
-                 cont);
+    VisitCompare(selector, opcode,
+                 g.UseRegisterOrStackPointer(left, opcode == kArm64Cmp),
+                 g.UseImmediate(right), cont);
   } else {
-    VisitCompare(selector, opcode, g.UseRegister(left), g.UseRegister(right),
-                 cont);
+    VisitCompare(selector, opcode,
+                 g.UseRegisterOrStackPointer(left, opcode == kArm64Cmp),
+                 g.UseRegister(right), cont);
   }
 }
 
@@ -2374,10 +2407,9 @@ void InstructionSelector::VisitSwitch(Node* node, const SwitchInfo& sw) {
     }
   }
 
-  // Generate a sequence of conditional jumps.
-  return EmitLookupSwitch(sw, value_operand);
+  // Generate a tree of conditional jumps.
+  return EmitBinarySearchSwitch(sw, value_operand);
 }
-
 
 void InstructionSelector::VisitWord32Equal(Node* const node) {
   Node* const user = node;
@@ -2708,7 +2740,7 @@ void InstructionSelector::VisitWord64AtomicStore(Node* node) {
 
 void InstructionSelector::VisitWord32AtomicExchange(Node* node) {
   ArchOpcode opcode = kArchNop;
-  MachineType type = AtomicOpRepresentationOf(node->op());
+  MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Int8()) {
     opcode = kWord32AtomicExchangeInt8;
   } else if (type == MachineType::Uint8()) {
@@ -2728,7 +2760,7 @@ void InstructionSelector::VisitWord32AtomicExchange(Node* node) {
 
 void InstructionSelector::VisitWord64AtomicExchange(Node* node) {
   ArchOpcode opcode = kArchNop;
-  MachineType type = AtomicOpRepresentationOf(node->op());
+  MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Uint8()) {
     opcode = kArm64Word64AtomicExchangeUint8;
   } else if (type == MachineType::Uint16()) {
@@ -2746,7 +2778,7 @@ void InstructionSelector::VisitWord64AtomicExchange(Node* node) {
 
 void InstructionSelector::VisitWord32AtomicCompareExchange(Node* node) {
   ArchOpcode opcode = kArchNop;
-  MachineType type = AtomicOpRepresentationOf(node->op());
+  MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Int8()) {
     opcode = kWord32AtomicCompareExchangeInt8;
   } else if (type == MachineType::Uint8()) {
@@ -2766,7 +2798,7 @@ void InstructionSelector::VisitWord32AtomicCompareExchange(Node* node) {
 
 void InstructionSelector::VisitWord64AtomicCompareExchange(Node* node) {
   ArchOpcode opcode = kArchNop;
-  MachineType type = AtomicOpRepresentationOf(node->op());
+  MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Uint8()) {
     opcode = kArm64Word64AtomicCompareExchangeUint8;
   } else if (type == MachineType::Uint16()) {
@@ -2786,7 +2818,7 @@ void InstructionSelector::VisitWord32AtomicBinaryOperation(
     Node* node, ArchOpcode int8_op, ArchOpcode uint8_op, ArchOpcode int16_op,
     ArchOpcode uint16_op, ArchOpcode word32_op) {
   ArchOpcode opcode = kArchNop;
-  MachineType type = AtomicOpRepresentationOf(node->op());
+  MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Int8()) {
     opcode = int8_op;
   } else if (type == MachineType::Uint8()) {
@@ -2822,7 +2854,7 @@ void InstructionSelector::VisitWord64AtomicBinaryOperation(
     Node* node, ArchOpcode uint8_op, ArchOpcode uint16_op, ArchOpcode uint32_op,
     ArchOpcode uint64_op) {
   ArchOpcode opcode = kArchNop;
-  MachineType type = AtomicOpRepresentationOf(node->op());
+  MachineType type = AtomicOpType(node->op());
   if (type == MachineType::Uint8()) {
     opcode = uint8_op;
   } else if (type == MachineType::Uint16()) {
@@ -3088,7 +3120,9 @@ static const ShuffleEntry arch_shuffles[] = {
      kArm64S8x2Reverse}};
 
 bool TryMatchArchShuffle(const uint8_t* shuffle, const ShuffleEntry* table,
-                         size_t num_entries, uint8_t mask, ArchOpcode* opcode) {
+                         size_t num_entries, bool is_swizzle,
+                         ArchOpcode* opcode) {
+  uint8_t mask = is_swizzle ? kSimd128Size - 1 : 2 * kSimd128Size - 1;
   for (size_t i = 0; i < num_entries; i++) {
     const ShuffleEntry& entry = table[i];
     int j = 0;
@@ -3120,60 +3154,59 @@ void ArrangeShuffleTable(Arm64OperandGenerator* g, Node* input0, Node* input1,
 }  // namespace
 
 void InstructionSelector::VisitS8x16Shuffle(Node* node) {
-  const uint8_t* shuffle = OpParameter<uint8_t*>(node->op());
-  uint8_t mask = CanonicalizeShuffle(node);
+  uint8_t shuffle[kSimd128Size];
+  bool is_swizzle;
+  CanonicalizeShuffle(node, shuffle, &is_swizzle);
   uint8_t shuffle32x4[4];
   Arm64OperandGenerator g(this);
   ArchOpcode opcode;
   if (TryMatchArchShuffle(shuffle, arch_shuffles, arraysize(arch_shuffles),
-                          mask, &opcode)) {
+                          is_swizzle, &opcode)) {
     VisitRRR(this, opcode, node);
     return;
   }
   Node* input0 = node->InputAt(0);
   Node* input1 = node->InputAt(1);
-  uint8_t bias;
-  if (TryMatchConcat(shuffle, mask, &bias)) {
+  uint8_t offset;
+  if (TryMatchConcat(shuffle, &offset)) {
     Emit(kArm64S8x16Concat, g.DefineAsRegister(node), g.UseRegister(input0),
-         g.UseRegister(input1), g.UseImmediate(bias));
+         g.UseRegister(input1), g.UseImmediate(offset));
     return;
   }
   int index = 0;
   if (TryMatch32x4Shuffle(shuffle, shuffle32x4)) {
     if (TryMatchDup<4>(shuffle, &index)) {
-      InstructionOperand src = index < 4 ? g.UseRegister(node->InputAt(0))
-                                         : g.UseRegister(node->InputAt(1));
-      Emit(kArm64S128Dup, g.DefineAsRegister(node), src, g.UseImmediate(4),
-           g.UseImmediate(index % 4));
+      DCHECK_GT(4, index);
+      Emit(kArm64S128Dup, g.DefineAsRegister(node), g.UseRegister(input0),
+           g.UseImmediate(4), g.UseImmediate(index % 4));
+    } else if (TryMatchIdentity(shuffle)) {
+      EmitIdentity(node);
     } else {
-      Emit(kArm64S32x4Shuffle, g.DefineAsRegister(node),
-           g.UseRegister(node->InputAt(0)), g.UseRegister(node->InputAt(1)),
-           g.UseImmediate(Pack4Lanes(shuffle32x4, mask)));
+      Emit(kArm64S32x4Shuffle, g.DefineAsRegister(node), g.UseRegister(input0),
+           g.UseRegister(input1), g.UseImmediate(Pack4Lanes(shuffle32x4)));
     }
     return;
   }
   if (TryMatchDup<8>(shuffle, &index)) {
-    InstructionOperand src = index < 8 ? g.UseRegister(node->InputAt(0))
-                                       : g.UseRegister(node->InputAt(1));
-    Emit(kArm64S128Dup, g.DefineAsRegister(node), src, g.UseImmediate(8),
-         g.UseImmediate(index % 8));
+    DCHECK_GT(8, index);
+    Emit(kArm64S128Dup, g.DefineAsRegister(node), g.UseRegister(input0),
+         g.UseImmediate(8), g.UseImmediate(index % 8));
     return;
   }
   if (TryMatchDup<16>(shuffle, &index)) {
-    InstructionOperand src = index < 16 ? g.UseRegister(node->InputAt(0))
-                                        : g.UseRegister(node->InputAt(1));
-    Emit(kArm64S128Dup, g.DefineAsRegister(node), src, g.UseImmediate(16),
-         g.UseImmediate(index % 16));
+    DCHECK_GT(16, index);
+    Emit(kArm64S128Dup, g.DefineAsRegister(node), g.UseRegister(input0),
+         g.UseImmediate(16), g.UseImmediate(index % 16));
     return;
   }
   // Code generator uses vtbl, arrange sources to form a valid lookup table.
   InstructionOperand src0, src1;
   ArrangeShuffleTable(&g, input0, input1, &src0, &src1);
   Emit(kArm64S8x16Shuffle, g.DefineAsRegister(node), src0, src1,
-       g.UseImmediate(Pack4Lanes(shuffle, mask)),
-       g.UseImmediate(Pack4Lanes(shuffle + 4, mask)),
-       g.UseImmediate(Pack4Lanes(shuffle + 8, mask)),
-       g.UseImmediate(Pack4Lanes(shuffle + 12, mask)));
+       g.UseImmediate(Pack4Lanes(shuffle)),
+       g.UseImmediate(Pack4Lanes(shuffle + 4)),
+       g.UseImmediate(Pack4Lanes(shuffle + 8)),
+       g.UseImmediate(Pack4Lanes(shuffle + 12)));
 }
 
 void InstructionSelector::VisitSignExtendWord8ToInt32(Node* node) {

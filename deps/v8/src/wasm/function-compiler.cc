@@ -4,18 +4,18 @@
 
 #include "src/wasm/function-compiler.h"
 
-#include "src/code-factory.h"
-#include "src/code-stubs.h"
 #include "src/compiler/wasm-compiler.h"
 #include "src/counters.h"
 #include "src/macro-assembler-inl.h"
 #include "src/wasm/baseline/liftoff-compiler.h"
+#include "src/wasm/wasm-code-manager.h"
 
 namespace v8 {
 namespace internal {
 namespace wasm {
 
 namespace {
+
 const char* GetCompilationModeAsString(
     WasmCompilationUnit::CompilationMode mode) {
   switch (mode) {
@@ -26,6 +26,14 @@ const char* GetCompilationModeAsString(
   }
   UNREACHABLE();
 }
+
+void RecordStats(const WasmCode* code, Counters* counters) {
+  counters->wasm_generated_code_size()->Increment(
+      static_cast<int>(code->instructions().size()));
+  counters->wasm_reloc_size()->Increment(
+      static_cast<int>(code->reloc_info().size()));
+}
+
 }  // namespace
 
 // static
@@ -34,29 +42,30 @@ WasmCompilationUnit::GetDefaultCompilationMode() {
   return FLAG_liftoff ? CompilationMode::kLiftoff : CompilationMode::kTurbofan;
 }
 
-WasmCompilationUnit::WasmCompilationUnit(Isolate* isolate, ModuleEnv* env,
-                                         wasm::NativeModule* native_module,
-                                         wasm::FunctionBody body,
-                                         wasm::WasmName name, int index,
-                                         Handle<Code> centry_stub,
-                                         CompilationMode mode,
-                                         Counters* counters, bool lower_simd)
-    : isolate_(isolate),
-      env_(env),
+WasmCompilationUnit::WasmCompilationUnit(WasmEngine* wasm_engine,
+                                         ModuleEnv* env,
+                                         NativeModule* native_module,
+                                         FunctionBody body, WasmName name,
+                                         int index, Counters* counters,
+                                         CompilationMode mode)
+    : env_(env),
+      wasm_engine_(wasm_engine),
       func_body_(body),
       func_name_(name),
-      counters_(counters ? counters : isolate->counters()),
-      centry_stub_(centry_stub),
+      counters_(counters),
       func_index_(index),
       native_module_(native_module),
-      lower_simd_(lower_simd),
       mode_(mode) {
   DCHECK_GE(index, env->module->num_imported_functions);
   DCHECK_LT(index, env->module->functions.size());
   // Always disable Liftoff for asm.js, for two reasons:
   //    1) asm-specific opcodes are not implemented, and
   //    2) tier-up does not work with lazy compilation.
-  if (env->module->is_asm_js()) mode = CompilationMode::kTurbofan;
+  if (env->module->origin == kAsmJsOrigin) mode = CompilationMode::kTurbofan;
+  if (V8_UNLIKELY(FLAG_wasm_tier_mask_for_testing) && index < 32 &&
+      (FLAG_wasm_tier_mask_for_testing & (1 << index))) {
+    mode = CompilationMode::kTurbofan;
+  }
   SwitchMode(mode);
 }
 
@@ -65,14 +74,12 @@ WasmCompilationUnit::WasmCompilationUnit(Isolate* isolate, ModuleEnv* env,
 WasmCompilationUnit::~WasmCompilationUnit() {}
 
 void WasmCompilationUnit::ExecuteCompilation() {
-  auto size_histogram = env_->module->is_wasm()
-                            ? counters_->wasm_wasm_function_size_bytes()
-                            : counters_->wasm_asm_function_size_bytes();
+  auto size_histogram = SELECT_WASM_COUNTER(counters_, env_->module->origin,
+                                            wasm, function_size_bytes);
   size_histogram->AddSample(
       static_cast<int>(func_body_.end - func_body_.start));
-  auto timed_histogram = env_->module->is_wasm()
-                             ? counters_->wasm_compile_wasm_function_time()
-                             : counters_->wasm_compile_asm_function_time();
+  auto timed_histogram = SELECT_WASM_COUNTER(counters_, env_->module->origin,
+                                             wasm_compile, function_time);
   TimedHistogramScope wasm_compile_function_time_scope(timed_histogram);
 
   if (FLAG_trace_wasm_compiler) {
@@ -92,9 +99,8 @@ void WasmCompilationUnit::ExecuteCompilation() {
   }
 }
 
-wasm::WasmCode* WasmCompilationUnit::FinishCompilation(
-    wasm::ErrorThrower* thrower) {
-  wasm::WasmCode* ret;
+WasmCode* WasmCompilationUnit::FinishCompilation(ErrorThrower* thrower) {
+  WasmCode* ret;
   switch (mode_) {
     case CompilationMode::kLiftoff:
       ret = liftoff_unit_->FinishCompilation(thrower);
@@ -107,6 +113,8 @@ wasm::WasmCode* WasmCompilationUnit::FinishCompilation(
   }
   if (ret == nullptr) {
     thrower->RuntimeError("Error finalizing code.");
+  } else {
+    RecordStats(ret, counters_);
   }
   return ret;
 }
@@ -124,7 +132,6 @@ void WasmCompilationUnit::SwitchMode(CompilationMode new_mode) {
       return;
     case CompilationMode::kTurbofan:
       DCHECK(!turbofan_unit_);
-      if (liftoff_unit_ != nullptr) liftoff_unit_->AbortCompilation();
       liftoff_unit_.reset();
       turbofan_unit_.reset(new compiler::TurbofanWasmCompilationUnit(this));
       return;
@@ -133,19 +140,18 @@ void WasmCompilationUnit::SwitchMode(CompilationMode new_mode) {
 }
 
 // static
-wasm::WasmCode* WasmCompilationUnit::CompileWasmFunction(
-    wasm::NativeModule* native_module, wasm::ErrorThrower* thrower,
-    Isolate* isolate, const wasm::ModuleWireBytes& wire_bytes, ModuleEnv* env,
-    const wasm::WasmFunction* function, CompilationMode mode) {
-  wasm::FunctionBody function_body{
-      function->sig, function->code.offset(),
-      wire_bytes.start() + function->code.offset(),
-      wire_bytes.start() + function->code.end_offset()};
+WasmCode* WasmCompilationUnit::CompileWasmFunction(
+    NativeModule* native_module, ErrorThrower* thrower, Isolate* isolate,
+    ModuleEnv* env, const WasmFunction* function, CompilationMode mode) {
+  ModuleWireBytes wire_bytes(native_module->wire_bytes());
+  FunctionBody function_body{function->sig, function->code.offset(),
+                             wire_bytes.start() + function->code.offset(),
+                             wire_bytes.start() + function->code.end_offset()};
 
-  WasmCompilationUnit unit(isolate, env, native_module, function_body,
+  WasmCompilationUnit unit(isolate->wasm_engine(), env, native_module,
+                           function_body,
                            wire_bytes.GetNameOrNull(function, env->module),
-                           function->func_index,
-                           CodeFactory::CEntry(isolate, 1), mode);
+                           function->func_index, isolate->counters(), mode);
   unit.ExecuteCompilation();
   return unit.FinishCompilation(thrower);
 }

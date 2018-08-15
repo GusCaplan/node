@@ -31,7 +31,8 @@ namespace internal {
     "Invalid ElementsKind for InternalArray or InternalPackedArray")           \
   V(kInvalidHandleScopeLevel, "Invalid HandleScope level")                     \
   V(kInvalidJumpTableIndex, "Invalid jump table index")                        \
-  V(kInvalidRegisterFileInGenerator, "invalid register file in generator")     \
+  V(kInvalidParametersAndRegistersInGenerator,                                 \
+    "invalid parameters and registers in generator")                           \
   V(kInvalidSharedFunctionInfoData, "Invalid SharedFunctionInfo data")         \
   V(kMissingBytecodeArray, "Missing bytecode array from function")             \
   V(kObjectNotTagged, "The object is not tagged")                              \
@@ -124,6 +125,7 @@ enum class AbortReason {
 
 const char* GetBailoutReason(BailoutReason reason);
 const char* GetAbortReason(AbortReason reason);
+bool IsValidAbortReason(int reason_id);
 
 }  // namespace internal
 }  // namespace v8

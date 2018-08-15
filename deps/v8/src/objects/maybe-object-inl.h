@@ -5,10 +5,8 @@
 #ifndef V8_OBJECTS_MAYBE_OBJECT_INL_H_
 #define V8_OBJECTS_MAYBE_OBJECT_INL_H_
 
+#include "src/objects-inl.h"
 #include "src/objects/maybe-object.h"
-
-#include "include/v8.h"
-#include "src/globals.h"
 
 namespace v8 {
 namespace internal {
@@ -26,7 +24,7 @@ Smi* MaybeObject::ToSmi() {
   return Smi::cast(reinterpret_cast<Object*>(this));
 }
 
-bool MaybeObject::IsStrongOrWeakHeapObject() {
+bool MaybeObject::IsStrongOrWeakHeapObject() const {
   if (IsSmi() || IsClearedWeakHeapObject()) {
     return false;
   }
@@ -53,7 +51,7 @@ bool MaybeObject::ToStrongOrWeakHeapObject(
   return true;
 }
 
-bool MaybeObject::IsStrongHeapObject() {
+bool MaybeObject::IsStrongHeapObject() const {
   return !HasWeakHeapObjectTag(this) && !IsSmi();
 }
 
@@ -70,11 +68,11 @@ HeapObject* MaybeObject::ToStrongHeapObject() {
   return reinterpret_cast<HeapObject*>(this);
 }
 
-bool MaybeObject::IsWeakHeapObject() {
+bool MaybeObject::IsWeakHeapObject() const {
   return HasWeakHeapObjectTag(this) && !IsClearedWeakHeapObject();
 }
 
-bool MaybeObject::IsWeakOrClearedHeapObject() {
+bool MaybeObject::IsWeakOrClearedHeapObject() const {
   return HasWeakHeapObjectTag(this);
 }
 
@@ -103,6 +101,8 @@ Object* MaybeObject::GetHeapObjectOrSmi() {
   }
   return GetHeapObject();
 }
+
+bool MaybeObject::IsObject() const { return IsSmi() || IsStrongHeapObject(); }
 
 Object* MaybeObject::ToObject() {
   DCHECK(!HasWeakHeapObjectTag(this));

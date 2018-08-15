@@ -16,7 +16,7 @@
 namespace v8 {
 namespace internal {
 
-class Utf16CharacterStream;
+class ScannerStream;
 
 namespace wasm {
 
@@ -49,8 +49,8 @@ class AsmJsParser {
 
   typedef EnumSet<StandardMember, uint64_t> StdlibSet;
 
-  explicit AsmJsParser(Zone* zone, uintptr_t stack_limit,
-                       Utf16CharacterStream* stream);
+  explicit AsmJsParser(Zone* zone, uintptr_t stack_limit, ScannerStream* stream,
+                       int start);
   bool Run();
   const char* failure_message() const { return failure_message_; }
   int failure_location() const { return failure_location_; }
@@ -76,9 +76,16 @@ class AsmJsParser {
   };
   // clang-format on
 
+  // A single import in asm.js can require multiple imports in wasm, if the
+  // function is used with different signatures. {cache} keeps the wasm
+  // imports for the single asm.js import of name {function_name}.
   struct FunctionImportInfo {
     Vector<const char> function_name;
-    WasmModuleBuilder::SignatureMap cache;
+    ZoneUnorderedMap<FunctionSig, uint32_t> cache;
+
+    // Constructor.
+    FunctionImportInfo(Vector<const char> name, Zone* zone)
+        : function_name(name), cache(zone) {}
   };
 
   struct VarInfo {

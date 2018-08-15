@@ -137,7 +137,7 @@ Handle<Object> Assembler::code_target_object_handle_at(Address pc) {
   SixByteInstr instr =
       Instruction::InstructionBits(reinterpret_cast<const byte*>(pc));
   int index = instr & 0xFFFFFFFF;
-  return code_targets_[index];
+  return GetCodeTarget(index);
 }
 
 HeapObject* RelocInfo::target_object() {
@@ -156,7 +156,7 @@ Handle<HeapObject> RelocInfo::target_object_handle(Assembler* origin) {
   }
 }
 
-void RelocInfo::set_target_object(HeapObject* target,
+void RelocInfo::set_target_object(Heap* heap, HeapObject* target,
                                   WriteBarrierMode write_barrier_mode,
                                   ICacheFlushMode icache_flush_mode) {
   DCHECK(IsCodeTarget(rmode_) || rmode_ == EMBEDDED_OBJECT);
@@ -164,9 +164,8 @@ void RelocInfo::set_target_object(HeapObject* target,
                                    reinterpret_cast<Address>(target),
                                    icache_flush_mode);
   if (write_barrier_mode == UPDATE_WRITE_BARRIER && host() != nullptr) {
-    host()->GetHeap()->incremental_marking()->RecordWriteIntoCode(host(), this,
-                                                                  target);
-    host()->GetHeap()->RecordWriteIntoCode(host(), this, target);
+    heap->incremental_marking()->RecordWriteIntoCode(host(), this, target);
+    heap->RecordWriteIntoCode(host(), this, target);
   }
 }
 
@@ -178,13 +177,6 @@ Address RelocInfo::target_external_reference() {
 void RelocInfo::set_target_external_reference(
     Address target, ICacheFlushMode icache_flush_mode) {
   DCHECK(rmode_ == RelocInfo::EXTERNAL_REFERENCE);
-  Assembler::set_target_address_at(pc_, constant_pool_, target,
-                                   icache_flush_mode);
-}
-
-void RelocInfo::set_wasm_code_table_entry(Address target,
-                                          ICacheFlushMode icache_flush_mode) {
-  DCHECK(rmode_ == RelocInfo::WASM_CODE_TABLE_ENTRY);
   Assembler::set_target_address_at(pc_, constant_pool_, target,
                                    icache_flush_mode);
 }
@@ -210,11 +202,12 @@ void RelocInfo::set_target_runtime_entry(Address target,
 void RelocInfo::WipeOut() {
   DCHECK(IsEmbeddedObject(rmode_) || IsCodeTarget(rmode_) ||
          IsRuntimeEntry(rmode_) || IsExternalReference(rmode_) ||
-         IsInternalReference(rmode_) || IsInternalReferenceEncoded(rmode_));
+         IsInternalReference(rmode_) || IsInternalReferenceEncoded(rmode_) ||
+         IsOffHeapTarget(rmode_));
   if (IsInternalReference(rmode_)) {
     // Jump table entry
     Memory::Address_at(pc_) = kNullAddress;
-  } else if (IsInternalReferenceEncoded(rmode_)) {
+  } else if (IsInternalReferenceEncoded(rmode_) || IsOffHeapTarget(rmode_)) {
     // mov sequence
     // Currently used only by deserializer, no need to flush.
     Assembler::set_target_address_at(pc_, constant_pool_, kNullAddress,
@@ -229,7 +222,7 @@ void RelocInfo::Visit(ObjectVisitor* visitor) {
   RelocInfo::Mode mode = rmode();
   if (mode == RelocInfo::EMBEDDED_OBJECT) {
     visitor->VisitEmbeddedPointer(host(), this);
-  } else if (RelocInfo::IsCodeTarget(mode)) {
+  } else if (RelocInfo::IsCodeTargetMode(mode)) {
     visitor->VisitCodeTarget(host(), this);
   } else if (mode == RelocInfo::EXTERNAL_REFERENCE) {
     visitor->VisitExternalReference(host(), this);
@@ -244,23 +237,6 @@ void RelocInfo::Visit(ObjectVisitor* visitor) {
 
 // Operand constructors
 Operand::Operand(Register rm) : rm_(rm), rmode_(RelocInfo::NONE) {}
-
-int32_t Assembler::emit_code_target(Handle<Code> target,
-                                    RelocInfo::Mode rmode) {
-  DCHECK(RelocInfo::IsCodeTarget(rmode));
-  RecordRelocInfo(rmode);
-
-  size_t current = code_targets_.size();
-  if (current > 0 && !target.is_null() &&
-      code_targets_.back().address() == target.address()) {
-    // Optimization if we keep jumping to the same code target.
-    current--;
-  } else {
-    code_targets_.push_back(target);
-  }
-  return current;
-}
-
 
 // Fetch the 32bit value from the FIXED_SEQUENCE IIHF / IILF
 Address Assembler::target_address_at(Address pc, Address constant_pool) {

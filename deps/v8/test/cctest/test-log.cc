@@ -36,10 +36,7 @@
 
 #include <unordered_set>
 #include <vector>
-// The C++ style guide recommends using <re2> instead of <regex>. However, the
-// former isn't available in V8.
-#include <regex>  // NOLINT(build/c++11)
-#include "src/api.h"
+#include "src/api-inl.h"
 #include "src/log-utils.h"
 #include "src/log.h"
 #include "src/objects-inl.h"
@@ -119,37 +116,42 @@ class ScopedLoggerInitializer {
     if (temp_file_ != nullptr) fclose(temp_file_);
     i::FLAG_prof = saved_prof_;
     i::FLAG_log = saved_log_;
-    log_.Dispose();
   }
 
   v8::Local<v8::Context>& env() { return env_; }
 
   v8::Isolate* isolate() { return isolate_; }
 
+  i::Isolate* i_isolate() { return reinterpret_cast<i::Isolate*>(isolate()); }
+
   Logger* logger() { return logger_; }
 
-  void PrintLog(int nofLines = 0) {
-    if (nofLines <= 0) {
-      printf("%s", log_.start());
+  void PrintLog(int requested_nof_lines = 0, const char* start = nullptr) {
+    if (requested_nof_lines <= 0) {
+      printf("%s", log_.c_str());
       return;
     }
-    // Try to print the last {nofLines} of the log.
-    const char* start = log_.start();
-    const char* current = log_.end();
-    while (current > start && nofLines > 0) {
+    // Try to print the last {requested_nof_lines} of the log.
+    if (start == nullptr) start = log_.c_str();
+    const char* current = start + log_.length();
+    int nof_lines = requested_nof_lines;
+    while (current > start && nof_lines > 0) {
       current--;
-      if (*current == '\n') nofLines--;
+      if (*current == '\n') nof_lines--;
     }
     printf(
         "======================================================\n"
-        "Last log lines:\n...%s\n"
+        "Last %i log lines:\n"
+        "======================================================\n"
+        "...\n%s\n"
         "======================================================\n",
-        current);
+        requested_nof_lines, current);
   }
 
   v8::Local<v8::String> GetLogString() {
-    return v8::String::NewFromUtf8(isolate_, log_.start(),
-                                   v8::NewStringType::kNormal, log_.length())
+    int length = static_cast<int>(log_.size());
+    return v8::String::NewFromUtf8(isolate_, log_.c_str(),
+                                   v8::NewStringType::kNormal, length)
         .ToLocalChecked();
   }
 
@@ -159,12 +161,14 @@ class ScopedLoggerInitializer {
     CHECK(exists);
   }
 
+  const char* GetEndPosition() { return log_.c_str() + log_.size(); }
+
   const char* FindLine(const char* prefix, const char* suffix = nullptr,
                        const char* start = nullptr) {
     // Make sure that StopLogging() has been called before.
     CHECK(log_.size());
-    if (start == nullptr) start = log_.start();
-    const char* end = log_.start() + log_.length();
+    if (start == nullptr) start = log_.c_str();
+    const char* end = GetEndPosition();
     return FindLogLine(start, end, prefix, suffix);
   }
 
@@ -176,7 +180,7 @@ class ScopedLoggerInitializer {
     const char* suffix = pairs[0][1];
     const char* last_position = FindLine(prefix, suffix, start);
     if (last_position == nullptr) {
-      PrintLog(50);
+      PrintLog(100, start);
       V8_Fatal(__FILE__, __LINE__, "Could not find log line: %s ... %s", prefix,
                suffix);
     }
@@ -186,13 +190,13 @@ class ScopedLoggerInitializer {
       suffix = pairs[i][1];
       const char* position = FindLine(prefix, suffix, start);
       if (position == nullptr) {
-        PrintLog(50);
+        PrintLog(100, start);
         V8_Fatal(__FILE__, __LINE__, "Could not find log line: %s ... %s",
                  prefix, suffix);
       }
       // Check that all string positions are in order.
       if (position <= last_position) {
-        PrintLog(50);
+        PrintLog(100, start);
         V8_Fatal(__FILE__, __LINE__,
                  "Log statements not in expected order (prev=%p, current=%p): "
                  "%s ... %s",
@@ -213,7 +217,7 @@ class ScopedLoggerInitializer {
                            const char* prefix, int field_index) {
     // Make sure that StopLogging() has been called before.
     CHECK(log_.size());
-    const char* current = log_.start();
+    const char* current = log_.c_str();
     while (current != nullptr) {
       current = FindLine(prefix, nullptr, current);
       if (current == nullptr) return;
@@ -250,7 +254,7 @@ class ScopedLoggerInitializer {
   v8::HandleScope scope_;
   v8::Local<v8::Context> env_;
   Logger* logger_;
-  i::Vector<const char> log_;
+  std::string log_;
 
   DISALLOW_COPY_AND_ASSIGN(ScopedLoggerInitializer);
 };
@@ -258,18 +262,23 @@ class ScopedLoggerInitializer {
 class TestCodeEventHandler : public v8::CodeEventHandler {
  public:
   explicit TestCodeEventHandler(v8::Isolate* isolate)
-      : v8::CodeEventHandler(isolate) {}
+      : v8::CodeEventHandler(isolate), isolate_(isolate) {}
 
   size_t CountLines(std::string prefix, std::string suffix = std::string()) {
-    if (!log_.length()) return 0;
+    if (log_.empty()) return 0;
 
-    std::regex expression("(^|\\n)" + prefix + ".*" + suffix + "(?=\\n|$)");
+    size_t match = 0;
+    for (const std::string& line : log_) {
+      size_t prefix_pos = line.find(prefix);
+      if (prefix_pos == std::string::npos) continue;
+      size_t suffix_pos = line.rfind(suffix);
+      if (suffix_pos == std::string::npos) continue;
+      if (suffix_pos != line.length() - suffix.length()) continue;
+      if (prefix_pos >= suffix_pos) continue;
+      match++;
+    }
 
-    size_t match_count(std::distance(
-        std::sregex_iterator(log_.begin(), log_.end(), expression),
-        std::sregex_iterator()));
-
-    return match_count;
+    return match;
   }
 
   void Handle(v8::CodeEvent* code_event) override {
@@ -277,8 +286,7 @@ class TestCodeEventHandler : public v8::CodeEventHandler {
     log_line += v8::CodeEvent::GetCodeEventTypeName(code_event->GetCodeType());
     log_line += " ";
     log_line += FormatName(code_event);
-    log_line += "\n";
-    log_ += log_line;
+    log_.push_back(log_line);
   }
 
  private:
@@ -286,8 +294,9 @@ class TestCodeEventHandler : public v8::CodeEventHandler {
     std::string name = std::string(code_event->GetComment());
     if (name.empty()) {
       v8::Local<v8::String> functionName = code_event->GetFunctionName();
-      std::string buffer(functionName->Utf8Length() + 1, 0);
-      functionName->WriteUtf8(&buffer[0], functionName->Utf8Length() + 1);
+      std::string buffer(functionName->Utf8Length(isolate_) + 1, 0);
+      functionName->WriteUtf8(isolate_, &buffer[0],
+                              functionName->Utf8Length(isolate_) + 1);
       // Sanitize name, removing unwanted \0 resulted from WriteUtf8
       name = std::string(buffer.c_str());
     }
@@ -295,7 +304,8 @@ class TestCodeEventHandler : public v8::CodeEventHandler {
     return name;
   }
 
-  std::string log_;
+  std::vector<std::string> log_;
+  v8::Isolate* isolate_;
 };
 
 }  // namespace
@@ -522,10 +532,11 @@ TEST(Issue23768) {
   CHECK(!evil_script.IsEmpty());
   CHECK(!evil_script->Run(env).IsEmpty());
   i::Handle<i::ExternalTwoByteString> i_source(
-      i::ExternalTwoByteString::cast(*v8::Utils::OpenHandle(*source)));
+      i::ExternalTwoByteString::cast(*v8::Utils::OpenHandle(*source)),
+      CcTest::i_isolate());
   // This situation can happen if source was an external string disposed
   // by its owner.
-  i_source->set_resource(nullptr);
+  i_source->SetResource(CcTest::i_isolate(), nullptr);
 
   // Must not crash.
   CcTest::i_isolate()->logger()->LogCompiledFunctions();
@@ -704,9 +715,9 @@ TEST(EquivalenceOfLoggingAndTraversal) {
     // The result either be the "true" literal or problem description.
     if (!result->IsTrue()) {
       v8::Local<v8::String> s = result->ToString(logger.env()).ToLocalChecked();
-      i::ScopedVector<char> data(s->Utf8Length() + 1);
+      i::ScopedVector<char> data(s->Utf8Length(isolate) + 1);
       CHECK(data.start());
-      s->WriteUtf8(data.start());
+      s->WriteUtf8(isolate, data.start());
       FATAL("%s\n", data.start());
     }
   }
@@ -736,9 +747,12 @@ TEST(LogVersion) {
 // https://crbug.com/539892
 // CodeCreateEvents with really large names should not crash.
 TEST(Issue539892) {
-  class : public i::CodeEventLogger {
+  class FakeCodeEventLogger : public i::CodeEventLogger {
    public:
-    void CodeMoveEvent(i::AbstractCode* from, Address to) override {}
+    explicit FakeCodeEventLogger(i::Isolate* isolate)
+        : CodeEventLogger(isolate) {}
+
+    void CodeMoveEvent(i::AbstractCode* from, i::AbstractCode* to) override {}
     void CodeDisableOptEvent(i::AbstractCode* code,
                              i::SharedFunctionInfo* shared) override {}
 
@@ -747,7 +761,7 @@ TEST(Issue539892) {
                            const char* name, int length) override {}
     void LogRecordedBuffer(const i::wasm::WasmCode* code, const char* name,
                            int length) override {}
-  } code_event_logger;
+  } code_event_logger(CcTest::i_isolate());
   SETUP_FLAGS();
   v8::Isolate::CreateParams create_params;
   create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
@@ -1054,8 +1068,19 @@ TEST(LogFunctionEvents) {
   v8::Isolate::CreateParams create_params;
   create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
   v8::Isolate* isolate = v8::Isolate::New(create_params);
+
   {
     ScopedLoggerInitializer logger(saved_log, saved_prof, isolate);
+
+    // Run some warmup code to help ignoring existing log entries.
+    CompileRun(
+        "function warmUp(a) {"
+        " let b = () => 1;"
+        " return function(c) { return a+b+c; };"
+        "};"
+        "warmUp(1)(2);"
+        "(function warmUpEndMarkerFunction(){})();");
+
     const char* source_text =
         "function lazyNotExecutedFunction() { return 'lazy' };"
         "function lazyFunction() { "
@@ -1071,13 +1096,14 @@ TEST(LogFunctionEvents) {
 
     logger.StopLogging();
 
-    // TODO(cbruni): Extend with first-execution log statements.
-    CHECK_NULL(
-        logger.FindLine("function,compile-lazy,", ",lazyNotExecutedFunction"));
-    // Only consider the log starting from the first preparse statement on.
+    // Ignore all the log entries that happened before warmup
     const char* start =
-        logger.FindLine("function,preparse-", ",lazyNotExecutedFunction");
+        logger.FindLine("function,first-execution", "warmUpEndMarkerFunction");
+    CHECK_NOT_NULL(start);
     const char* pairs[][2] = {
+        // Create a new script
+        {"script,create", nullptr},
+        {"script-details", nullptr},
         // Step 1: parsing top-level script, preparsing functions
         {"function,preparse-", ",lazyNotExecutedFunction"},
         // Missing name for preparsing lazyInnerFunction
@@ -1092,7 +1118,7 @@ TEST(LogFunctionEvents) {
 
         // Step 2: compiling top-level script and eager functions
         // - Compiling script without name.
-        {"function,compile,,", nullptr},
+        {"function,compile,", nullptr},
         {"function,compile,", ",eagerFunction"},
 
         // Step 3: start executing script
