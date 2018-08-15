@@ -347,6 +347,7 @@ struct PackageConfig {
   V(tty_constructor_template, v8::FunctionTemplate)                           \
   V(udp_constructor_function, v8::Function)                                   \
   V(url_constructor_function, v8::Function)                                   \
+  V(wasm_streaming_callback, v8::Function)                                    \
   V(write_wrap_template, v8::ObjectTemplate)
 
 class Environment;

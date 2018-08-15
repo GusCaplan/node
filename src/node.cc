@@ -30,6 +30,7 @@
 #include "node_debug_options.h"
 #include "node_perf.h"
 #include "node_context_data.h"
+#include "stream_base-inl.h"
 #include "tracing/traced_value.h"
 
 #if defined HAVE_PERFCTR
@@ -3731,6 +3732,73 @@ inline int Start(Isolate* isolate, IsolateData* isolate_data,
   return exit_code;
 }
 
+class WasmStreamListener : public StreamListener {
+ public:
+  WasmStreamListener(std::shared_ptr<v8::WasmStreaming> s) :
+    StreamListener(),
+    wasm_streaming_(s) {}
+
+  void OnStreamRead(ssize_t nread, const uv_buf_t& buf) {
+    if (nread == UV_EOF) {
+      wasm_streaming_->Finish();
+    } else if (nread < 0) {
+      wasm_streaming_->Abort(MaybeLocal<Value>());
+    } else {
+      wasm_streaming_->OnBytesReceived(
+          reinterpret_cast<uint8_t*>(buf.base), buf.len);
+    }
+  }
+
+ private:
+  std::shared_ptr<v8::WasmStreaming> wasm_streaming_;
+};
+
+static void WasmResolvedStreamingCallback(
+    const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+
+  Local<Value> source = args[0];
+
+  std::shared_ptr<v8::WasmStreaming> streaming =
+      v8::WasmStreaming::Unpack(args.GetIsolate(), args.Data());
+
+  if (source->IsArrayBufferView()) {
+    Local<v8::ArrayBufferView> ui = source.As<v8::ArrayBufferView>();
+    v8::ArrayBuffer::Contents ab_c = ui->Buffer()->GetContents();
+    auto data = static_cast<uint8_t*>(ab_c.Data()) + ui->ByteOffset();
+    streaming->OnBytesReceived(data, ui->ByteLength());
+    streaming->Finish();
+  } else {
+    Environment* env = Environment::GetCurrent(isolate);
+    Local<Context> context = env->context();
+    Local<Function> fn = env->wasm_streaming_callback();
+
+    TryCatch try_catch(isolate);
+
+    Local<Value> wrap;
+    if (fn->Call(context, fn, 1, &source).ToLocal(&wrap)) {
+      auto stream = reinterpret_cast<StreamBase*>(wrap.As<v8::External>()->Value());
+      auto listener = new WasmStreamListener(streaming);
+      stream->PushStreamListener(listener);
+    } else {
+      streaming->Abort(try_catch.Exception());
+    }
+  }
+}
+
+static void WasmStreamingCallback(const FunctionCallbackInfo<Value>& args) {
+  Isolate* isolate = args.GetIsolate();
+  Local<Context> context = isolate->GetCurrentContext();
+
+  auto resolver = Promise::Resolver::New(context).ToLocalChecked();
+  resolver->Resolve(context, args[0]).ToChecked();
+
+  resolver->GetPromise()->Then(
+      context,
+      Function::New(context, WasmResolvedStreamingCallback, args.Data())
+      .ToLocalChecked()).ToLocalChecked();
+}
+
 bool AllowWasmCodeGenerationCallback(
     Local<Context> context, Local<String>) {
   Local<Value> wasm_code_gen =
@@ -3759,6 +3827,7 @@ Isolate* NewIsolate(ArrayBufferAllocator* allocator, uv_loop_t* event_loop) {
   isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kExplicit);
   isolate->SetFatalErrorHandler(OnFatalError);
   isolate->SetAllowWasmCodeGenerationCallback(AllowWasmCodeGenerationCallback);
+  isolate->SetWasmStreamingCallback(WasmStreamingCallback);
 
   return isolate;
 }

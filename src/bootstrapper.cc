@@ -109,6 +109,13 @@ void SetupPromises(const FunctionCallbackInfo<Value>& args) {
   env->set_promise_reject_handled_function(args[1].As<Function>());
 }
 
+void SetupWebassemblyStreaming(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Isolate* isolate = env->isolate();
+
+  env->set_wasm_streaming_callback(args[0].As<Function>());
+}
+
 #define BOOTSTRAP_METHOD(name, fn) env->SetMethod(bootstrapper, #name, fn)
 
 // The Bootstrapper object is an ephemeral object that is used only during
@@ -127,6 +134,7 @@ void SetupBootstrapObject(Environment* env,
   BOOTSTRAP_METHOD(_memoryUsage, MemoryUsage);
   BOOTSTRAP_METHOD(_rawDebug, RawDebug);
   BOOTSTRAP_METHOD(_umask, Umask);
+  BOOTSTRAP_METHOD(_setupWasmStreaming, SetupWebassemblyStreaming);
 
 #if defined(__POSIX__) && !defined(__ANDROID__) && !defined(__CloudABI__)
   if (env->is_main_thread()) {
