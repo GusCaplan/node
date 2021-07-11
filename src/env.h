@@ -482,6 +482,9 @@ constexpr size_t kFsStatsBufferLength =
   V(qlogoutputstream_constructor_template, v8::ObjectTemplate)                 \
   V(tcp_constructor_template, v8::FunctionTemplate)                            \
   V(tty_constructor_template, v8::FunctionTemplate)                            \
+  V(wasm_streaming_callback, v8::Function)                                     \
+  V(wasm_streaming_cache_callback, v8::Function)                               \
+  V(wasm_streaming_cache_handler, v8::Object)                                  \
   V(write_wrap_template, v8::ObjectTemplate)                                   \
   V(worker_heap_snapshot_taker_template, v8::ObjectTemplate)                   \
   V(x509_constructor_template, v8::FunctionTemplate)
